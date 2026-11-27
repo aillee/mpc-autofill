@@ -378,7 +378,49 @@ class Details:
     quantity: int = attr.ib(default=0)
     stock: str = attr.ib(default=constants.Cardstocks.S30.value)
     foil: bool = attr.ib(default=False)
+    finish: str = attr.ib(default="")
     allowed_to_exceed_project_max_size: bool = attr.ib(default=False)
+
+    def __attrs_post_init__(self) -> None:
+        resolved = constants.resolve_finish(finish=self.finish, foil=self.foil)
+        if resolved is None:
+            raise ValidationException(
+                f"Order finish {bold(self.finish)} is not supported. "
+                f"Use {bold(constants.CardFinish.none)}, {bold(constants.CardFinish.holographic)}, "
+                f"{bold(constants.CardFinish.shards)}, or an MPC print type code such as "
+                f"{bold(constants.HOLOGRAPHIC_FRONT_CODE)}."
+            )
+        finish, foil = resolved
+        object.__setattr__(self, "finish", finish)
+        object.__setattr__(self, "foil", foil)
+
+    def with_quantity(self, quantity: int, allowed_to_exceed_project_max_size: bool) -> "Details":
+        return Details(
+            quantity=quantity,
+            stock=self.stock,
+            foil=self.foil,
+            finish=self.finish,
+            allowed_to_exceed_project_max_size=allowed_to_exceed_project_max_size,
+        )
+
+    def finish_label(self) -> str:
+        """Wording used where older orders said foil or nonfoil."""
+
+        if self.finish == constants.CardFinish.holographic:
+            return "foil"
+        if self.finish == constants.CardFinish.none:
+            return "nonfoil"
+        return self.finish
+
+    def site_print_type(self, target_site: constants.TargetSites) -> str:
+        """`dro_product_effect` value to select. Only called for a foil print type."""
+
+        site = target_site.value
+        if self.finish == constants.CardFinish.holographic:
+            return site.foil_dropdown_element_value
+        if self.finish == constants.CardFinish.shards:
+            return site.shards_dropdown_element_value
+        return self.finish
 
     # region initialisation
 
@@ -404,11 +446,13 @@ class Details:
             quantity = int(quantity_text)
         stock = details_dict[constants.DetailsTags.stock].text or constants.Cardstocks.S30
         foil: bool = details_dict[constants.DetailsTags.foil].text == "true"
+        finish = (details_dict[constants.DetailsTags.finish].text or "").strip()
 
         details = cls(
             quantity=quantity,
             stock=stock,
             foil=foil,
+            finish=finish,
             allowed_to_exceed_project_max_size=allowed_to_exceed_project_max_size,
         )
         details.validate()
@@ -427,10 +471,8 @@ class CardOrder:
     def offset_slots(self, offset: int, allowed_to_exceed_project_max_size: bool) -> "CardOrder":
         return CardOrder(
             name=self.name,
-            details=Details(
+            details=self.details.with_quantity(
                 quantity=min(self.details.quantity + offset, PROJECT_MAX_SIZE),
-                stock=self.details.stock,
-                foil=self.details.foil,
                 allowed_to_exceed_project_max_size=allowed_to_exceed_project_max_size,
             ),
             fronts=self.fronts.offset_slots(offset=offset),
@@ -440,10 +482,8 @@ class CardOrder:
     def truncate(self) -> "CardOrder":
         return CardOrder(
             name=self.name,
-            details=Details(
+            details=self.details.with_quantity(
                 quantity=min(self.details.quantity, PROJECT_MAX_SIZE),
-                stock=self.details.stock,
-                foil=self.details.foil,
                 allowed_to_exceed_project_max_size=False,
             ),
             fronts=self.fronts.truncate(),
@@ -451,7 +491,11 @@ class CardOrder:
         )
 
     def is_combinable(self, other: "CardOrder") -> bool:
-        return self.details.foil == other.details.foil and self.details.stock == other.details.stock
+        return (
+            self.details.foil == other.details.foil
+            and self.details.finish == other.details.finish
+            and self.details.stock == other.details.stock
+        )
 
     def combine(self, other: "CardOrder") -> "CardOrder":
         """
@@ -464,11 +508,9 @@ class CardOrder:
         # users should never hit this assertion because we group by details before combining
         assert self.is_combinable(other=other)
         return CardOrder(
-            name=f"Combined {self.details.stock} ({'foil' if self.details.foil else 'nonfoil'})",
-            # assume that stock and foil finish are identical because the two orders are combinable
-            details=Details(
-                foil=self.details.foil,
-                stock=self.details.stock,
+            name=f"Combined {self.details.stock} ({self.details.finish_label()})",
+            # assume that stock and finish are identical because the two orders are combinable
+            details=self.details.with_quantity(
                 quantity=self.details.quantity + other.details.quantity,
                 allowed_to_exceed_project_max_size=True,
             ),
@@ -479,11 +521,15 @@ class CardOrder:
     def get_project_sizes(self) -> list[int]:
         naive_split = f"Split every {constants.PROJECT_MAX_SIZE} cards"
         interactive_split = "Let me specify how to split the cards"
+        if self.details.finish in (constants.CardFinish.none, constants.CardFinish.holographic):
+            finish_text = f"{'' if self.details.foil else 'non-'}foil"
+        else:
+            finish_text = self.details.finish_label()
         questions = {
             "type": "list",
             "name": "split_choices",
             "message": (
-                f"Your project/s with cardstock {self.details.stock} ({'' if self.details.foil else 'non-'}foil)\n"
+                f"Your project/s with cardstock {self.details.stock} ({finish_text})\n"
                 f"contain {self.details.quantity} cards, which exceeds the maximum project size of "
                 f"{constants.PROJECT_MAX_SIZE}.\n"
                 f"How should the project/s be split to fit within {constants.PROJECT_MAX_SIZE} cards at most?"
@@ -539,10 +585,8 @@ class CardOrder:
         # create the split orders
         split_orders = [
             CardOrder(
-                details=Details(
+                details=self.details.with_quantity(
                     quantity=raw_split,
-                    stock=self.details.stock,
-                    foil=self.details.foil,
                     allowed_to_exceed_project_max_size=False,
                 ),
                 fronts=CardImageCollection(num_slots=raw_split, face=constants.Faces.front),
@@ -675,7 +719,7 @@ class CardOrder:
     def get_overview(self) -> str:
         return (
             f"Total of {bold(self.details.quantity)} cards. "
-            f"{bold(self.details.stock)} cardstock ({bold('foil' if self.details.foil else 'nonfoil')}). "
+            f"{bold(self.details.stock)} cardstock ({bold(self.details.finish_label())}). "
         )
 
     # endregion
@@ -707,8 +751,8 @@ def aggregate_and_split_orders(
     if len(orders) == 1:
         return orders
 
-    def key(order: CardOrder) -> int:
-        return hash((order.details.foil, order.details.stock))
+    def key(order: CardOrder) -> tuple[str, bool, str]:
+        return (order.details.stock, order.details.foil, order.details.finish)
 
     aggregated_orders = orders
     if combine_orders:
@@ -722,7 +766,7 @@ def aggregate_and_split_orders(
             for aggregated_order in aggregated_orders
             for aggregated_and_split_order in aggregated_order.split()
         ],
-        key=lambda o: (o.details.stock, o.details.foil, o.details.quantity),
+        key=lambda o: (o.details.stock, o.details.foil, o.details.finish, o.details.quantity),
     )
 
     return aggregated_and_split_orders

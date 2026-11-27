@@ -567,14 +567,20 @@ class AutofillDriver:
             quantity=order.details.quantity, dropdown_id=self.target_site.value.quantity_dropdown_element_id
         )
 
-        # Switch the finish to foil if the user ordered foil cards
+        # Full color (no `<finish>`, or `<foil>false</foil>`) leaves the site's default print type.
+        # `<foil>true</foil>` still selects the site's holographic option. Any other finish selects
+        # that option's value on the same dropdown.
         if order.details.foil:
             if self.target_site.value.supports_foil:
-                logger.debug("Selecting foil finish...")
+                print_type = order.details.site_print_type(self.target_site)
+                if print_type == self.target_site.value.foil_dropdown_element_value:
+                    logger.debug("Selecting foil finish...")
+                else:
+                    logger.debug(f"Selecting print type {order.details.finish} ({print_type})...")
                 foil_dropdown = Select(
                     self.driver.find_element(by=By.ID, value=self.target_site.value.print_type_dropdown_element_id)
                 )
-                foil_dropdown.select_by_value(self.target_site.value.foil_dropdown_element_value)
+                foil_dropdown.select_by_value(print_type)
             else:
                 logger.warning(
                     textwrap.dedent(
