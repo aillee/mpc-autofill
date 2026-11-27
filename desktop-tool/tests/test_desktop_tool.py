@@ -58,6 +58,7 @@ def assert_details_identical(a: Details, b: Details) -> None:
     assert a.quantity == b.quantity, f"Quantity {a.quantity} does not match {b.quantity}"
     assert a.stock == b.stock, f"Stock {a.stock} does not match {b.stock}"
     assert a.foil == b.foil, f"Foil {a.foil} does not match {b.foil}"
+    assert a.finish == b.finish, f"Finish {a.finish} does not match {b.finish}"
 
 
 def assert_orders_identical(a: CardOrder, b: CardOrder) -> None:
@@ -686,6 +687,221 @@ def test_details_quantity_greater_than_max_size(input_enter, details_element_qua
 def test_details_invalid_cardstock(input_enter, details_element_invalid_cardstock):
     with pytest.raises(ValidationException):
         Details.from_element(details_element_invalid_cardstock, allowed_to_exceed_project_max_size=False)
+
+
+def _order_xml(
+    *,
+    foil: str,
+    finish: str | None,
+    quantity: int = 3,
+    stock: str = "(S30) Standard Smooth",
+) -> str:
+    finish_element = "" if finish is None else f"<finish>{finish}</finish>"
+    image = os.path.join(CARDS_FILE_PATH, f"{TEST_IMAGE}.png")
+    lotus = os.path.join(CARDS_FILE_PATH, f"{SIMPLE_LOTUS}.png")
+    slots = ",".join(str(slot) for slot in range(quantity))
+    return f"""
+        <order>
+            <details>
+                <quantity>{quantity}</quantity>
+                <stock>{stock}</stock>
+                <foil>{foil}</foil>
+                {finish_element}
+            </details>
+            <fronts>
+                <card>
+                    <id>{image}</id>
+                    <slots>{slots}</slots>
+                    <name>{TEST_IMAGE}.png</name>
+                </card>
+            </fronts>
+            <backs>
+                <card>
+                    <id>{lotus}</id>
+                    <slots>1</slots>
+                    <name>{SIMPLE_LOTUS}.png</name>
+                </card>
+            </backs>
+            <cardback>{image}</cardback>
+        </order>
+    """
+
+
+def _order_from_xml(xml: str) -> CardOrder:
+    return CardOrder.from_element(
+        working_directory=FILE_PATH,
+        element=ElementTree.fromstring(textwrap.dedent(xml)),
+        allowed_to_exceed_project_max_size=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "foil, finish, expected_finish, expected_foil, expected_print_type",
+    [
+        ("false", None, constants.CardFinish.none, False, None),
+        ("true", None, constants.CardFinish.holographic, True, constants.HOLOGRAPHIC_FRONT_CODE),
+        ("true", "", constants.CardFinish.holographic, True, constants.HOLOGRAPHIC_FRONT_CODE),
+        ("false", "shards", constants.CardFinish.shards, True, constants.SILVER_SHARDS_FRONT_CODE),
+        ("true", "none", constants.CardFinish.none, False, None),
+        ("false", "Shards", constants.CardFinish.shards, True, constants.SILVER_SHARDS_FRONT_CODE),
+        (
+            "false",
+            "Holographic silver foil shards (front)",
+            constants.CardFinish.shards,
+            True,
+            constants.SILVER_SHARDS_FRONT_CODE,
+        ),
+        ("false", "EF_580", constants.CardFinish.shards, True, constants.SILVER_SHARDS_FRONT_CODE),
+        ("false", "EF_055", constants.CardFinish.holographic, True, constants.HOLOGRAPHIC_FRONT_CODE),
+        ("false", "EF_581", "EF_581", True, "EF_581"),
+        ("true", "holographic", constants.CardFinish.holographic, True, constants.HOLOGRAPHIC_FRONT_CODE),
+    ],
+)
+def test_finish_xml(foil, finish, expected_finish, expected_foil, expected_print_type):
+    order = _order_from_xml(_order_xml(foil=foil, finish=finish))
+    image = os.path.join(CARDS_FILE_PATH, f"{TEST_IMAGE}.png")
+    lotus = os.path.join(CARDS_FILE_PATH, f"{SIMPLE_LOTUS}.png")
+    assert order.details.finish == expected_finish
+    assert order.details.foil is expected_foil
+    assert order.fronts.cards_by_id[image].slots == {0, 1, 2}
+    assert order.backs.cards_by_id[lotus].slots == {1}
+    assert order.backs.cards_by_id[image].slots == {0, 2}
+    if expected_print_type is None:
+        assert order.details.foil is False
+    else:
+        assert order.details.site_print_type(constants.TargetSites.MakePlayingCards) == expected_print_type
+
+
+def test_finish_overrides_foil_for_combining():
+    holographic = _order_from_xml(_order_xml(foil="true", finish=None, quantity=2))
+    named_holographic = _order_from_xml(_order_xml(foil="false", finish="holographic", quantity=2))
+    shards = _order_from_xml(_order_xml(foil="false", finish="shards", quantity=2))
+    same_code = _order_from_xml(_order_xml(foil="false", finish="EF_580", quantity=2))
+    assert holographic.is_combinable(named_holographic)
+    assert shards.is_combinable(same_code)
+    assert not holographic.is_combinable(shards)
+
+
+def test_invalid_finish(input_enter):
+    with pytest.raises(ValidationException):
+        _order_from_xml(_order_xml(foil="false", finish="rainbow"))
+
+
+def test_plastic_stock_rejects_shards(input_enter):
+    with pytest.raises(ValidationException):
+        _order_from_xml(_order_xml(foil="false", finish="shards", stock="(P10) Plastic"))
+
+
+def test_split_and_offset_keep_finish(monkeypatch, monkeypatch_project_max_size):
+    order = _order_from_xml(_order_xml(foil="false", finish="shards"))
+    offset = order.offset_slots(offset=1, allowed_to_exceed_project_max_size=True)
+    assert offset.details.finish == constants.CardFinish.shards
+    assert offset.details.foil is True
+    monkeypatch.setattr(src.order, "prompt", lambda _: {"split_choices": "Split every 2 cards"})
+    monkeypatch_project_max_size(2)
+    parts = order.split()
+    assert [part.details.quantity for part in parts] == [2, 1]
+    assert all(part.details.finish == constants.CardFinish.shards and part.details.foil for part in parts)
+
+
+def test_aggregate_respects_finish_and_no_combine_orders():
+    holographic = _order_from_xml(_order_xml(foil="true", finish=None, quantity=2))
+    shards = _order_from_xml(_order_xml(foil="false", finish="shards", quantity=2))
+    more_shards = _order_from_xml(_order_xml(foil="true", finish="shards", quantity=2))
+    site = constants.TargetSites.MakePlayingCards
+
+    separated = aggregate_and_split_orders([shards, more_shards], target_site=site, combine_orders=False)
+    assert [order.details.quantity for order in separated] == [2, 2]
+    assert all(order.details.finish == constants.CardFinish.shards for order in separated)
+
+    combined = aggregate_and_split_orders([shards, more_shards], target_site=site, combine_orders=True)
+    image = os.path.join(CARDS_FILE_PATH, f"{TEST_IMAGE}.png")
+    lotus = os.path.join(CARDS_FILE_PATH, f"{SIMPLE_LOTUS}.png")
+    assert len(combined) == 1
+    assert combined[0].details.quantity == 4
+    assert combined[0].details.finish == constants.CardFinish.shards
+    assert combined[0].details.foil is True
+    assert combined[0].fronts.cards_by_id[image].slots == {0, 1, 2, 3}
+    assert combined[0].backs.cards_by_id[lotus].slots == {1, 3}
+    assert combined[0].backs.cards_by_id[image].slots == {0, 2}
+
+    mixed = aggregate_and_split_orders([holographic, shards], target_site=site, combine_orders=True)
+    assert sorted(order.details.finish for order in mixed) == [
+        constants.CardFinish.holographic,
+        constants.CardFinish.shards,
+    ]
+    assert all(order.details.quantity == 2 for order in mixed)
+
+
+class _BracketOption:
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def get_attribute(self, name: str) -> str:
+        return self._value
+
+
+class _DesignElement:
+    options = [_BracketOption("18"), _BracketOption("36"), _BracketOption("55")]
+
+
+class _DesignDriver:
+    def find_element(self, by: str, value: str) -> _DesignElement:
+        return _DesignElement()
+
+
+def test_define_project_selects_configured_print_type(monkeypatch):
+    selected: list[tuple[str, str]] = []
+
+    class RecordingSelect:
+        def __init__(self, element: _DesignElement) -> None:
+            self.element = element
+
+        def select_by_visible_text(self, text: str) -> None:
+            selected.append(("text", text))
+
+        def select_by_value(self, value: str) -> None:
+            selected.append(("value", value))
+
+        @property
+        def options(self) -> list[_BracketOption]:
+            return self.element.options
+
+    monkeypatch.setattr("src.driver.Select", RecordingSelect)
+
+    def run(order: CardOrder, site: constants.TargetSites) -> list[tuple[str, str]]:
+        selected.clear()
+        autofill = object.__new__(AutofillDriver)
+        autofill.driver = _DesignDriver()
+        autofill.target_site = site
+        autofill.state = constants.States.defining_order
+
+        def set_state(state: str, action: str | None = None) -> None:
+            return None
+
+        autofill.set_state = set_state  # type: ignore[method-assign]
+        autofill.define_project(order)
+        return list(selected)
+
+    shards = CardOrder(details=Details(quantity=3, stock=constants.Cardstocks.S30, finish="shards"))
+    holographic = CardOrder(details=Details(quantity=3, stock=constants.Cardstocks.S30, foil=True))
+    plain = CardOrder(details=Details(quantity=3, stock=constants.Cardstocks.S30, foil=False))
+
+    shards_selection = run(shards, constants.TargetSites.MakePlayingCards)
+    assert ("value", constants.SILVER_SHARDS_FRONT_CODE) in shards_selection
+    assert ("text", constants.Cardstocks.S30.value) in shards_selection
+
+    holographic_selection = run(holographic, constants.TargetSites.MakePlayingCards)
+    assert ("value", constants.HOLOGRAPHIC_FRONT_CODE) in holographic_selection
+    assert ("value", constants.SILVER_SHARDS_FRONT_CODE) not in holographic_selection
+
+    plain_values = [value for kind, value in run(plain, constants.TargetSites.MakePlayingCards) if kind == "value"]
+    assert plain_values == ["18"]
+
+    printer_studio = run(shards, constants.TargetSites.PrinterStudio)
+    assert ("text", "Standard (smooth)") in printer_studio
+    assert ("value", constants.SILVER_SHARDS_FRONT_CODE) not in printer_studio
+    assert [value for kind, value in printer_studio if kind == "value"] == ["18"]
 
 
 # endregion

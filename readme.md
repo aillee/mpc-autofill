@@ -32,3 +32,5 @@ If you're here to download the desktop client, check the [Releases]("https://git
 # Documentation
 
 Our docs are available in the repo's [Wiki](https://github.com/chilli-axe/mpc-autofill/wiki).
+
+The desktop tool's order XML can set a MakePlayingCards print type with `<finish>` (`none`, `holographic`, `shards`, or an `EF_` code such as `EF_580` for holographic silver foil shards front). `<foil>` still works when `<finish>` is omitted. See `desktop-tool/readme.md`.

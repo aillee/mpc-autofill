@@ -1,3 +1,4 @@
+import re
 from enum import Enum, StrEnum, member
 from functools import partial
 
@@ -62,6 +63,15 @@ class DetailsTags(StrEnum):
     quantity = "quantity"
     stock = "stock"
     foil = "foil"
+    finish = "finish"
+
+
+class CardFinish(StrEnum):
+    """Canonical print types an order can name without using an MPC effect code."""
+
+    none = "none"
+    holographic = "holographic"
+    shards = "shards"
 
 
 class CardTags(StrEnum):
@@ -93,6 +103,64 @@ class ImageResizeMethods(Enum):
     LANCZOS = 1
 
 
+# MakePlayingCards `dro_product_effect` option values.
+#
+# publish.js `renderEffectInfo()` fills that dropdown from
+# GET https://www.makeplayingcards.com/api/publish/getproducteffectinfo.ashx
+#     ?unitno=<hidd_itemid>&attachno=<dro_paper_type value>&minPieces=18&pieces=<bracket>
+# on https://www.makeplayingcards.com/design/custom-blank-card.html
+# (Custom Game Cards, 63x88mm, product code PC140626-01, hidd_itemid C380050185D1C1AF).
+# Queried 2026-11-27 with attachno PA_014, the option value for "(S30) Standard Smooth",
+# at brackets 18, 36, 55, and 612. The same EffectNo values came back for S27 (PA_016),
+# S33 (PA_059), and M31 (PA_015):
+#   EF_055  "Holographic (front)"                         EffectGroup HOLOGRAPHIC
+#   EF_580  "Holographic silver foil shards (front)"      EffectGroup HGCSHARD
+# Selenium selects EffectNo. "Full color print" is the empty-value default and is not
+# in that response. P10 (PA_017) returned no print types.
+HOLOGRAPHIC_FRONT_CODE = "EF_055"
+SILVER_SHARDS_FRONT_CODE = "EF_580"
+
+_EFFECT_CODE = re.compile(r"EF_[0-9A-Z]+")
+_FINISH_ALIASES: dict[str, tuple[str, bool]] = {
+    "none": (CardFinish.none, False),
+    "nonfoil": (CardFinish.none, False),
+    "non-foil": (CardFinish.none, False),
+    "full color print": (CardFinish.none, False),
+    "full colour print": (CardFinish.none, False),
+    "holographic": (CardFinish.holographic, True),
+    "holographic (front)": (CardFinish.holographic, True),
+    "foil": (CardFinish.holographic, True),
+    "shards": (CardFinish.shards, True),
+    "holographic silver foil shards": (CardFinish.shards, True),
+    "holographic silver foil shards (front)": (CardFinish.shards, True),
+    "holographic silver foil shards front": (CardFinish.shards, True),
+}
+
+
+def resolve_finish(finish: str, foil: bool) -> tuple[str, bool] | None:
+    """
+    Map an XML `<finish>` string to a canonical finish and whether it is a foil print type.
+    An empty finish means the element was omitted: `<foil>true</foil>` stays holographic.
+    """
+
+    text = finish.strip()
+    if text == "":
+        if foil:
+            return CardFinish.holographic, True
+        return CardFinish.none, False
+    alias = _FINISH_ALIASES.get(text.lower())
+    if alias is not None:
+        return alias
+    code = text.upper()
+    if code == HOLOGRAPHIC_FRONT_CODE:
+        return CardFinish.holographic, True
+    if code == SILVER_SHARDS_FRONT_CODE:
+        return CardFinish.shards, True
+    if _EFFECT_CODE.fullmatch(code):
+        return code, True
+    return None
+
+
 @attr.s
 class TargetSite:
     """
@@ -115,7 +183,8 @@ class TargetSite:
     quantity_dropdown_element_id: str = attr.ib(default="dro_choosesize")
     cardstock_dropdown_element_id: str = attr.ib(default="dro_paper_type")
     print_type_dropdown_element_id: str = attr.ib(default="dro_product_effect")
-    foil_dropdown_element_value: str = attr.ib(default="EF_055")
+    foil_dropdown_element_value: str = attr.ib(default=HOLOGRAPHIC_FRONT_CODE)
+    shards_dropdown_element_value: str = attr.ib(default=SILVER_SHARDS_FRONT_CODE)
     cardstock_site_name_mapping: dict[Cardstocks, str] = attr.ib(
         default={cardstock: cardstock.value for cardstock in Cardstocks}
     )
